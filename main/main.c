@@ -1,5 +1,5 @@
 #include <string.h>
-#include <inttypes.h> // For PRId32
+#include <inttypes.h> // For PRId32, PRIu32
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
@@ -24,21 +24,25 @@
 #define BUF_SIZE 256
 
 static const char *TAG = "mqtt_dht";
-static char mqtt_broker[64] = "";
 
+// --- Configuration Variables ---
+static char ssid[32] = "";
+static char password[64] = "";
+static char mqtt_broker[64] = "";
+static char mqtt_client_id[64] = "";
+
+// --- Sensor & MQTT State ---
 static float temperature = 0.0;
 static float humidity = 0.0;
 static esp_mqtt_client_handle_t mqtt_client = NULL;
+static bool mqtt_connected = false;
 
 // Event group to signal Wi-Fi connection
 static EventGroupHandle_t wifi_event_group;
 #define WIFI_CONNECTED_BIT BIT0
 
-static char ssid[32] = "";
-static char password[64] = "";
-
+// --- Console Initialization ---
 void init_console(void) {
-    // Configure UART parameters
     uart_config_t uart_config = {
         .baud_rate = 115200,
         .data_bits = UART_DATA_8_BITS,
@@ -49,22 +53,16 @@ void init_console(void) {
     };
     uart_param_config(UART_NUM_0, &uart_config);
     uart_driver_install(UART_NUM_0, 256, 0, 0, NULL, 0);
-
-    // Set UART pins (default for console)
     uart_set_pin(UART_NUM_0, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-
-    // Suppress deprecation warnings for ESP-IDF v5.4.1
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-    // Register UART for VFS
     esp_vfs_dev_uart_register();
-
-    // Set line endings for the UART port
     esp_vfs_dev_uart_port_set_rx_line_endings(UART_NUM_0, ESP_LINE_ENDINGS_CRLF);
     esp_vfs_dev_uart_port_set_tx_line_endings(UART_NUM_0, ESP_LINE_ENDINGS_CRLF);
 #pragma GCC diagnostic pop
 }
 
+// --- NVS Initialization (No changes needed) ---
 static void init_nvs(void)
 {
     esp_err_t ret = nvs_flash_init();
@@ -75,6 +73,7 @@ static void init_nvs(void)
     ESP_ERROR_CHECK(ret);
 }
 
+// --- DHT11 Initialization & Reading ---
 static void init_dht11(void) {
     gpio_config_t io_conf = {
         .pin_bit_mask = (1ULL << DHT_PIN),
@@ -93,12 +92,13 @@ static esp_err_t read_dht11(float *temp, float *hum)
     return ESP_FAIL;
 }
 
+// --- NVS Data Handling ---
 static void load_provision_data(void)
 {
     nvs_handle_t nvs_handle;
     esp_err_t ret = nvs_open("wifi", NVS_READONLY, &nvs_handle);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to open NVS: %s", esp_err_to_name(ret));
+        ESP_LOGW(TAG, "Failed to open NVS for reading: %s. Assuming first boot.", esp_err_to_name(ret));
         return;
     }
 
@@ -113,121 +113,154 @@ static void load_provision_data(void)
     len = sizeof(mqtt_broker);
     nvs_get_str(nvs_handle, "broker", mqtt_broker, &len);
 
+    len = sizeof(mqtt_client_id);
+    nvs_get_str(nvs_handle, "client_id", mqtt_client_id, &len);
+    // Ensure null termination even if NVS read fails or string is max length
+    mqtt_client_id[sizeof(mqtt_client_id) - 1] = '\0';
+
+
     nvs_close(nvs_handle);
 }
 
-
-static void save_provision_data(const char *new_ssid, const char *new_pass, const char *new_broker)
+// --- Save Provision Data ---
+static void save_provision_data(const char *new_ssid, const char *new_pass, const char *new_broker, const char *new_client_id)
 {
     nvs_handle_t nvs_handle;
     esp_err_t ret = nvs_open("wifi", NVS_READWRITE, &nvs_handle);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to open NVS: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "Failed to open NVS for writing: %s", esp_err_to_name(ret));
         return;
     }
 
     nvs_set_str(nvs_handle, "ssid", new_ssid);
     nvs_set_str(nvs_handle, "password", new_pass);
     nvs_set_str(nvs_handle, "broker", new_broker);
+    nvs_set_str(nvs_handle, "client_id", new_client_id);
 
-    nvs_commit(nvs_handle);
+    ret = nvs_commit(nvs_handle);
+     if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to commit NVS data: %s", esp_err_to_name(ret));
+    } else {
+        ESP_LOGI(TAG, "Provisioning data saved successfully.");
+    }
     nvs_close(nvs_handle);
 }
 
+// --- Read Line from UART ---
+static void read_line_from_uart(char* dest_buffer, size_t max_len, const char* prompt) {
+    if (dest_buffer == NULL || max_len == 0) {
+        ESP_LOGE(TAG, "read_line_from_uart: Invalid arguments");
+        return;
+    }
 
+    printf("%s", prompt);
+    fflush(stdout);
+    memset(dest_buffer, 0, max_len); // Clear destination buffer first
+    int current_pos = 0;
+
+    while (current_pos < max_len - 1) {
+        char received_char;
+        // Read one byte at a time, waiting indefinitely
+        int len = uart_read_bytes(UART_NUM_0, (uint8_t*)&received_char, 1, portMAX_DELAY);
+
+        if (len > 0) {
+            // Handle Backspace ('\b' or ASCII 8) and DEL (ASCII 127)
+            if (received_char == '\b' || received_char == 127) {
+                if (current_pos > 0) {
+                    current_pos--;
+                    // Erase character visually on the console:
+                    // Send backspace, space, backspace sequence
+                    uart_write_bytes(UART_NUM_0, "\b \b", 3);
+                }
+            }
+            // Handle Enter/Newline (CR or LF)
+            else if (received_char == '\n' || received_char == '\r') {
+                dest_buffer[current_pos] = '\0'; // Null-terminate the string
+                printf("\n");                   // Move to the next line on the console
+                fflush(stdout);
+                break; // Exit loop on Enter key
+            }
+            // Handle regular printable characters
+            else if (received_char >= ' ' && received_char <= '~') {
+                 // Echo character back to the console
+                uart_write_bytes(UART_NUM_0, &received_char, 1);
+                // Store character in buffer
+                dest_buffer[current_pos] = received_char;
+                current_pos++;
+            }
+            // Ignore other non-printable characters
+        }
+        // Handle potential errors from uart_read_bytes if needed (e.g., len < 0)
+        // else { ESP_LOGE(TAG, "UART read error"); break; }
+    }
+    // Ensure null termination even if max_len-1 characters were entered without Enter
+    dest_buffer[max_len - 1] = '\0';
+
+    // Optional: Log the final string read
+    // ESP_LOGI(TAG, "Read line: '%s'", dest_buffer);
+    // ESP_LOG_BUFFER_HEXDUMP(TAG, dest_buffer, strlen(dest_buffer) + 1, ESP_LOG_INFO);
+}
+
+
+// --- Provisioning Wi-Fi Credentials ---
 static void provision_wifi_credentials(void)
 {
-    char buffer[BUF_SIZE];
-    int pos = 0;
+    // char buffer[BUF_SIZE]; // No longer needed if read_line_from_uart is used directly
+    // int pos = 0;          // No longer needed
 
     // Load existing credentials if they exist
-    load_provision_data();
-    if (strlen(ssid) > 0 && strlen(password) > 0 && strlen(mqtt_broker) > 0) {
-        printf("Current SSID: %s, MQTT Broker: %s\n", ssid, mqtt_broker);
+	load_provision_data();
+	ESP_LOGI(TAG, "Client ID loaded from NVS: '%s'", mqtt_client_id);
+	ESP_LOG_BUFFER_HEXDUMP(TAG, mqtt_client_id, strlen(mqtt_client_id) + 1, ESP_LOG_INFO); // +1 for null term
+
+    if (strlen(ssid) > 0 && strlen(password) > 0 && strlen(mqtt_broker) > 0 && strlen(mqtt_client_id) > 0) {
+        printf("Current SSID: %s\n", ssid);
+        printf("Current MQTT Broker: %s\n", mqtt_broker);
+        printf("Current MQTT Client ID: %s\n", mqtt_client_id); // Show loaded client ID
         printf("Press 'r' to reprovision, or any other key to continue...\n");
         fflush(stdout);
 
         char choice;
-        int len = uart_read_bytes(UART_NUM, (uint8_t*)&choice, 1, 5000 / portTICK_PERIOD_MS); // 5-second timeout
-        if (len <= 0 || choice != 'r') {
+        int len = uart_read_bytes(UART_NUM_0, (uint8_t*)&choice, 1, pdMS_TO_TICKS(5000)); // 5-second timeout
+        if (len <= 0 || (choice != 'r' && choice != 'R')) {
+            ESP_LOGI(TAG, "Using existing credentials.");
             return; // Use existing credentials
         }
+        ESP_LOGI(TAG, "Reprovisioning requested.");
+        // Clear existing strings before asking for new ones
+        memset(ssid, 0, sizeof(ssid));
+        memset(password, 0, sizeof(password));
+        memset(mqtt_broker, 0, sizeof(mqtt_broker));
+        memset(mqtt_client_id, 0, sizeof(mqtt_client_id));
+    } else {
+         ESP_LOGI(TAG, "No complete credentials found in NVS, starting provisioning.");
     }
 
     // Prompt for SSID
-    printf("Enter Wi-Fi SSID: ");
-    fflush(stdout);
-    pos = 0;
-    while (1) {
-        int len = uart_read_bytes(UART_NUM, (uint8_t*)&buffer[pos], 1, 1000 / portTICK_PERIOD_MS);
-        if (len > 0) {
-            if (buffer[pos] == '\n' || buffer[pos] == '\r') {
-                buffer[pos] = '\0';
-                strncpy(ssid, buffer, sizeof(ssid) - 1);
-                ssid[sizeof(ssid) - 1] = '\0';
-                break;
-            }
-            pos++;
-            if (pos >= sizeof(ssid) - 1) {
-                buffer[pos] = '\0';
-                strncpy(ssid, buffer, sizeof(ssid) - 1);
-                ssid[sizeof(ssid) - 1] = '\0';
-                break;
-            }
-        }
-    }
+    read_line_from_uart(ssid, sizeof(ssid), "Enter Wi-Fi SSID: ");
 
     // Prompt for password
-    printf("Enter Wi-Fi Password: ");
-    fflush(stdout);
-    pos = 0;
-    while (1) {
-        int len = uart_read_bytes(UART_NUM, (uint8_t*)&buffer[pos], 1, 1000 / portTICK_PERIOD_MS);
-        if (len > 0) {
-            if (buffer[pos] == '\n' || buffer[pos] == '\r') {
-                buffer[pos] = '\0';
-                strncpy(password, buffer, sizeof(password) - 1);
-                password[sizeof(password) - 1] = '\0';
-                break;
-            }
-            pos++;
-            if (pos >= sizeof(password) - 1) {
-                buffer[pos] = '\0';
-                strncpy(password, buffer, sizeof(password) - 1);
-                password[sizeof(password) - 1] = '\0';
-                break;
-            }
-        }
-    }
+    read_line_from_uart(password, sizeof(password), "Enter Wi-Fi Password: ");
 
     // Prompt for MQTT broker
-    printf("Enter MQTT Broker (e.g., 192.168.1.158): ");
-    fflush(stdout);
-    pos = 0;
-    while (1) {
-        int len = uart_read_bytes(UART_NUM, (uint8_t*)&buffer[pos], 1, 1000 / portTICK_PERIOD_MS);
-        if (len > 0) {
-            if (buffer[pos] == '\n' || buffer[pos] == '\r') {
-                buffer[pos] = '\0';
-                strncpy(mqtt_broker, buffer, sizeof(mqtt_broker) - 1);
-                mqtt_broker[sizeof(mqtt_broker) - 1] = '\0';
-                break;
-            }
-            pos++;
-            if (pos >= sizeof(mqtt_broker) - 1) {
-                buffer[pos] = '\0';
-                strncpy(mqtt_broker, buffer, sizeof(mqtt_broker) - 1);
-                mqtt_broker[sizeof(mqtt_broker) - 1] = '\0';
-                break;
-            }
-        }
-    }
+    read_line_from_uart(mqtt_broker, sizeof(mqtt_broker), "Enter MQTT Broker IP or Hostname: ");
 
-    printf("Saving SSID: %s, Password: %s, MQTT Broker: %s\n", ssid, password, mqtt_broker);
-    save_provision_data(ssid, password, mqtt_broker);
+        // Prompt for MQTT Client ID with corrected, simple guidance string
+    read_line_from_uart(mqtt_client_id, sizeof(mqtt_client_id),
+   "Enter Unique MQTT Client ID (use A-Z, a-z, 0-9, -, _ ; avoid spaces, /, #, +): ");
+
+    printf("\nSaving configuration:\n");
+    printf("  SSID: %s\n", ssid);
+    printf("  Password: [HIDDEN]\n"); // Keep password hidden
+    printf("  MQTT Broker: %s\n", mqtt_broker);
+    printf("  MQTT Client ID: %s\n", mqtt_client_id);
+    fflush(stdout);
+
+    save_provision_data(ssid, password, mqtt_broker, mqtt_client_id);
 }
 
 
+// --- Wi-Fi Event Handler ---
 static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data)
 {
     static int retry_count = 0;
@@ -238,13 +271,14 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
         ESP_LOGI(TAG, "Wi-Fi started, attempting to connect...");
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         if (retry_count < MAX_RETRIES) {
+            vTaskDelay(pdMS_TO_TICKS(5000)); // Add delay before retrying
             esp_wifi_connect();
             retry_count++;
-            ESP_LOGI(TAG, "Wi-Fi disconnected, reason: %d, retrying (%d/%d)...", 
+            ESP_LOGI(TAG, "Wi-Fi disconnected, reason: %d, retrying (%d/%d)...",
                      ((wifi_event_sta_disconnected_t*)event_data)->reason, retry_count, MAX_RETRIES);
         } else {
-            ESP_LOGE(TAG, "Failed to connect to Wi-Fi after %d retries", MAX_RETRIES);
-            esp_restart();
+            ESP_LOGE(TAG, "Failed to connect to Wi-Fi after %d retries, restarting...", MAX_RETRIES);
+            esp_restart(); // Restart if connection fails persistently
         }
         xEventGroupClearBits(wifi_event_group, WIFI_CONNECTED_BIT);
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
@@ -255,8 +289,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
     }
 }
 
-static bool mqtt_connected = false;
-
+// --- MQTT Event Handler ---
 static void mqtt_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data)
 {
     esp_mqtt_event_handle_t event = event_data;
@@ -264,144 +297,164 @@ static void mqtt_event_handler(void* arg, esp_event_base_t event_base, int32_t e
     switch (event_id) {
         case MQTT_EVENT_CONNECTED:
             mqtt_connected = true;
-            ESP_LOGI(TAG, "MQTT connected to broker");
+            ESP_LOGI(TAG, "MQTT connected to broker (Client ID: %s)", mqtt_client_id); // Log client ID on connect
             break;
         case MQTT_EVENT_DISCONNECTED:
             mqtt_connected = false;
-            ESP_LOGI(TAG, "MQTT disconnected from broker");
+            ESP_LOGW(TAG, "MQTT disconnected from broker"); // Changed to Warning
+            // The client library handles reconnection automatically by default
             break;
         case MQTT_EVENT_PUBLISHED:
-            ESP_LOGI(TAG, "MQTT message published, msg_id=%d", event->msg_id);
+            // This event can be verbose, often logged just before in the publish call
+            // ESP_LOGI(TAG, "MQTT message published, msg_id=%d", event->msg_id);
+            break;
+         case MQTT_EVENT_BEFORE_CONNECT:
+            ESP_LOGI(TAG, "MQTT_EVENT_BEFORE_CONNECT");
             break;
         case MQTT_EVENT_ERROR:
-            ESP_LOGE(TAG, "MQTT error occurred");
+             ESP_LOGE(TAG, "MQTT_EVENT_ERROR");
+            if (event->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT) {
+                ESP_LOGE(TAG, "Last error code reported from esp-tls: 0x%x", event->error_handle->esp_tls_last_esp_err);
+                ESP_LOGE(TAG, "Last tls stack error number: 0x%x", event->error_handle->esp_tls_stack_err);
+                ESP_LOGE(TAG, "Last captured errno : %d (%s)", event->error_handle->esp_transport_sock_errno,
+                        strerror(event->error_handle->esp_transport_sock_errno));
+            } else if (event->error_handle->error_type == MQTT_ERROR_TYPE_CONNECTION_REFUSED) {
+                ESP_LOGE(TAG, "Connection refused error: 0x%x", event->error_handle->connect_return_code);
+            } else {
+                ESP_LOGE(TAG, "Unknown error type: 0x%x", event->error_handle->error_type);
+            }
             break;
         default:
-            ESP_LOGI(TAG, "Other MQTT event id:%" PRId32, event_id);
+            ESP_LOGI(TAG, "Other MQTT event id: %" PRId32, event_id);
             break;
     }
 }
 
+// --- Main Application Logic ---
 void app_main(void)
 {
     // Initialize UART console
     init_console();
+    ESP_LOGI(TAG, "System Booted. Console Initialized.");
 
     // Initialize NVS
     init_nvs();
+    ESP_LOGI(TAG, "NVS Initialized.");
 
-    // Initialize DHT11
+    // Initialize DHT11 (GPIO setup)
     init_dht11();
+    ESP_LOGI(TAG, "DHT11 GPIO Initialized.");
 
-    // Provision Wi-Fi credentials
-    provision_wifi_credentials();
+    // Provision Wi-Fi & MQTT credentials
+    provision_wifi_credentials(); // This loads first, then prompts if needed
 
-    // Check if Wi-Fi credentials are set
-    if (strlen(ssid) == 0 || strlen(password) == 0) {
-        ESP_LOGE(TAG, "Wi-Fi credentials not set, cannot connect");
-        return;
+    if (strlen(ssid) == 0 || strlen(password) == 0 || strlen(mqtt_broker) == 0 || strlen(mqtt_client_id) == 0) {
+        ESP_LOGE(TAG, "Incomplete credentials (SSID, PWD, Broker, ClientID). Please provision via console and restart.");
+        // Enter an infinite loop or restart after a delay
+         while(1) { vTaskDelay(pdMS_TO_TICKS(10000)); }
+        // esp_restart(); // Or just restart
+        return; // Should not be reached if looping or restarting
     }
+    ESP_LOGI(TAG, "Credentials loaded/provisioned.");
+    ESP_LOGI(TAG, "Connecting to SSID: %s", ssid);
+    ESP_LOGI(TAG, "Using MQTT Broker: %s", mqtt_broker);
+    ESP_LOGI(TAG, "Using MQTT Client ID: %s", mqtt_client_id);
 
     // Initialize Wi-Fi
     wifi_event_group = xEventGroupCreate();
-    esp_netif_init();
-    esp_event_loop_create_default();
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_sta();
 
     // Register Wi-Fi event handlers
-    esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL);
-    esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL);
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    esp_wifi_init(&cfg);
-    esp_wifi_set_mode(WIFI_MODE_STA);
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
 
     wifi_config_t wifi_config = {0};
-    strncpy((char*)wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid));
-    strncpy((char*)wifi_config.sta.password, password, sizeof(wifi_config.sta.password));
-    wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK; // Explicitly set WPA2-PSK
-    esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
-    esp_wifi_start();
+    strncpy((char*)wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid) - 1);
+    strncpy((char*)wifi_config.sta.password, password, sizeof(wifi_config.sta.password) - 1);
+    wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK; // Or other appropriate auth mode
+    // Set PMF configuration based on network requirements if needed
+    // wifi_config.sta.pmf_cfg.capable = true;
+    // wifi_config.sta.pmf_cfg.required = false;
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
 
+    ESP_LOGI(TAG, "Waiting for Wi-Fi connection...");
     // Wait for Wi-Fi connection
-    xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
-    ESP_LOGI(TAG, "Wi-Fi connected successfully");
+    EventBits_t bits = xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdFALSE, portMAX_DELAY);
 
-    if (mqtt_broker[0] == '\0') {
-        ESP_LOGE(TAG, "MQTT broker string is empty, aborting...");
-        return;
+    if (bits & WIFI_CONNECTED_BIT) {
+         ESP_LOGI(TAG, "Wi-Fi connected successfully.");
+    } else {
+        ESP_LOGE(TAG, "Failed to connect to Wi-Fi. Restarting...");
+        esp_restart(); // Restart if connection fails
     }
 
-    // Initialize MQTT
-	ESP_LOGI(TAG, "Attempting to connect to MQTT broker at %s:%d", mqtt_broker,
-			 MQTT_PORT);
-			 
-	char full_uri[96];
-	memset(full_uri, 0, sizeof(full_uri));
+    // Construct Broker URI
+    ESP_LOGI(TAG, "Attempting to connect to MQTT broker at %s:%d", mqtt_broker, MQTT_PORT);
+    char full_uri[96]; // Increased size slightly for safety
+    snprintf(full_uri, sizeof(full_uri), "mqtt://%s:%d", mqtt_broker, MQTT_PORT);
+    ESP_LOGI(TAG, "Using broker URI: %s", full_uri);
 
-	snprintf(full_uri, sizeof(full_uri), "mqtt://%s:%d", mqtt_broker,
-			 MQTT_PORT);
-			 
-	// Log final URI to inspect its integrity
-	ESP_LOGI(TAG, "Using broker URI: %s", full_uri);
-	ESP_LOG_BUFFER_HEXDUMP(TAG, full_uri, strlen(full_uri), ESP_LOG_INFO);
+    esp_mqtt_client_config_t mqtt_cfg = {
+        .broker.address.uri = full_uri,
+        .credentials.client_id = mqtt_client_id,
+        // Defaults: TCP transport, auto-reconnect enabled
+    };
 
-	esp_mqtt_client_config_t mqtt_cfg = {
-		.broker.address.uri = full_uri, // e.g. "mqtt://192.168.1.158:1883"
-	};
+	ESP_LOGI(TAG, "Client ID being passed to init: '%s'", mqtt_cfg.credentials.client_id);
+ 	ESP_LOG_BUFFER_HEXDUMP(TAG, mqtt_cfg.credentials.client_id, strlen(mqtt_cfg.credentials.client_id) + 1, ESP_LOG_INFO);
+    ESP_LOGI(TAG, "Free heap before MQTT init: %" PRIu32, esp_get_free_heap_size());
+    ESP_LOGI(TAG, "Initializing MQTT client...");
+    mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
 
-    ESP_LOGI(TAG, "Free heap before MQTT init: %" PRIu32, esp_get_free_heap_size()); // Requires #include <inttypes.h>
-	// Initialize MQTT client
-	ESP_LOGI(TAG, "Initializing MQTT client...");
-	mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
-	if (mqtt_client == NULL) {
-		ESP_LOGE(TAG, "Failed to initialize MQTT client");
-		// ===>>> ADD THIS: Stop further execution <<<===
-		// Option 1: Restart the ESP32
-		esp_restart();
-		// Option 2: Enter an infinite loop or return from app_main if
-		// appropriate while(1) { vTaskDelay(1000 / portTICK_PERIOD_MS); }
-		// return;
-	}
+    if (mqtt_client == NULL) {
+        ESP_LOGE(TAG, "Failed to initialize MQTT client. Restarting...");
+        vTaskDelay(pdMS_TO_TICKS(5000));
+        esp_restart(); // Restart if client init fails
+    }
 
-	esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
-    esp_mqtt_client_start(mqtt_client);
+    ESP_ERROR_CHECK(esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_mqtt_client_start(mqtt_client));
+    ESP_LOGI(TAG, "MQTT client started. Waiting for connection...");
 
-    // Read DHT11 sensor and publish data
+    // Main loop to read sensor and publish
+    char payload[200]; // Increased size to accommodate client ID prefix
     while (1) {
-        if (read_dht11(&temperature, &humidity) == ESP_OK) {
-            int msg_id = -1;
-            char payload[128];
-            snprintf(payload, sizeof(payload), "{\"temperature\": %.1f, \"humidity\": %.1f}", temperature, humidity);
+        if (mqtt_connected) { // Only try to publish if connected
+            if (read_dht11(&temperature, &humidity) == ESP_OK) {
+                snprintf(payload, sizeof(payload), "%s: {\"temperature\": %.1f, \"humidity\": %.1f}",
+                         mqtt_client_id, temperature, humidity);
 
-            ESP_LOGI(TAG, "Publishing data: %s", payload);
-            msg_id = esp_mqtt_client_publish(mqtt_client, MQTT_TOPIC, payload, 0, 1, 0);
-            if (msg_id >= 0) {
-                ESP_LOGI(TAG, "Published: %s, msg_id=%d", payload, msg_id);
+                ESP_LOGI(TAG, "Publishing data: %s", payload);
+                int msg_id = esp_mqtt_client_publish(mqtt_client, MQTT_TOPIC, payload, 0, 1, 0); // QoS 1
+                if (msg_id >= 0) {
+                    ESP_LOGI(TAG, "Publish requested (QoS 1), msg_id=%d. Payload: %s", msg_id, payload);
+                } else {
+                    ESP_LOGE(TAG, "Failed to queue publish message, error code %d", msg_id);
+                }
             } else {
-                ESP_LOGE(TAG, "Failed to publish message, msg_id=%d", msg_id);
-            }
-            
-			if (!mqtt_connected) {
-                ESP_LOGE(TAG, "MQTT not connected, cannot publish data");
+                 ESP_LOGW(TAG, "Failed to read DHT11 sensor."); // Changed to warning
+                snprintf(payload, sizeof(payload), "%s: DHT11 Sensor offline.", mqtt_client_id);
+
+                ESP_LOGI(TAG, "Publishing offline status: %s", payload);
+                 int msg_id = esp_mqtt_client_publish(mqtt_client, MQTT_TOPIC, payload, 0, 1, 0); // QoS 1
+                if (msg_id >= 0) {
+                    ESP_LOGI(TAG, "Publish requested (QoS 1), msg_id=%d. Payload: %s", msg_id, payload);
+                } else {
+                    ESP_LOGE(TAG, "Failed to queue publish message, error code %d", msg_id);
+                }
             }
         } else {
-            ESP_LOGE(TAG, "Failed to read DHT11 sensor, retrying...");
-            int msg_id = -1;
-            char payload[128];
-            snprintf(payload, sizeof(payload), "DHT11 Sensor offline. Retrying...");
-
-            ESP_LOGI(TAG, "Publishing offline message: %s", payload);
-            msg_id = esp_mqtt_client_publish(mqtt_client, MQTT_TOPIC, payload, 0, 1, 0);
-            if (msg_id >= 0) {
-                ESP_LOGI(TAG, "Published: %s, msg_id=%d", payload, msg_id);
-            } else {
-                ESP_LOGE(TAG, "Failed to publish offline message, msg_id=%d", msg_id);
-            }
-            if(!mqtt_connected) {
-                ESP_LOGE(TAG, "MQTT not connected, cannot publish offline message");
-            }
+             ESP_LOGW(TAG, "MQTT not connected, skipping publish attempt.");
+             // Optionally add a longer delay here if disconnected to avoid spamming logs
+             // vTaskDelay(pdMS_TO_TICKS(10000)); // e.g., wait 10 seconds if disconnected
         }
-        vTaskDelay(5000 / portTICK_PERIOD_MS); // Publish every 5 seconds
+        vTaskDelay(pdMS_TO_TICKS(5000)); // Publish every 5 seconds (adjust as needed)
     }
 }
