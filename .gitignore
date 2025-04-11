@@ -1,0 +1,30 @@
+# ESP-IDF build artifacts
+/build/
+/sdkconfig
+*.bin
+*.elf
+*.map
+*.uf2
+
+# NVS partition data (if generated locally, usually not)
+nvs.csv
+nvs_partition.bin
+
+# Python virtual environment (if created inside project)
+/managed_components/
+.espressif/
+
+# Eclipse files (optional, commit if team uses Eclipse exclusively)
+.project
+.cproject
+.settings/
+*.prefs
+
+# Other common ignores
+*.bak
+*.swp
+*~
+.#*
+
+# Sensitive info (Add any files containing secrets if NOT using NVS like you are)
+# my_secrets.h
