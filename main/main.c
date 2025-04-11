@@ -22,6 +22,7 @@
 #define DHT_PIN GPIO_NUM_4
 #define UART_NUM UART_NUM_0 // Use UART0 for serial communication
 #define BUF_SIZE 256
+#undef  DEBUG_PASSWORD_SHOW // Define to enable password echo for debugging
 
 static const char *TAG = "mqtt_dht";
 
@@ -62,7 +63,7 @@ void init_console(void) {
 #pragma GCC diagnostic pop
 }
 
-// --- NVS Initialization (No changes needed) ---
+// --- NVS Initialization ---
 static void init_nvs(void)
 {
     esp_err_t ret = nvs_flash_init();
@@ -147,7 +148,8 @@ static void save_provision_data(const char *new_ssid, const char *new_pass, cons
 }
 
 // --- Read Line from UART ---
-static void read_line_from_uart(char* dest_buffer, size_t max_len, const char* prompt) {
+
+static void read_line_from_uart(char* dest_buffer, size_t max_len, const char* prompt, bool is_password) { // Added bool is_password
     if (dest_buffer == NULL || max_len == 0) {
         ESP_LOGE(TAG, "read_line_from_uart: Invalid arguments");
         return;
@@ -169,7 +171,6 @@ static void read_line_from_uart(char* dest_buffer, size_t max_len, const char* p
                 if (current_pos > 0) {
                     current_pos--;
                     // Erase character visually on the console:
-                    // Send backspace, space, backspace sequence
                     uart_write_bytes(UART_NUM_0, "\b \b", 3);
                 }
             }
@@ -182,31 +183,35 @@ static void read_line_from_uart(char* dest_buffer, size_t max_len, const char* p
             }
             // Handle regular printable characters
             else if (received_char >= ' ' && received_char <= '~') {
-                 // Echo character back to the console
-                uart_write_bytes(UART_NUM_0, &received_char, 1);
-                // Store character in buffer
+                // --- START Conditional Echo Logic ---
+                if (is_password) {
+                    #ifdef DEBUG_PASSWORD_SHOW
+                        // If debug macro is defined, echo the actual character
+                        uart_write_bytes(UART_NUM_0, &received_char, 1);
+                    #else
+                        // Otherwise, echo an asterisk '*'
+                        uart_write_bytes(UART_NUM_0, "*", 1);
+                    #endif
+                } else {
+                    // Not a password, echo the actual character
+                    uart_write_bytes(UART_NUM_0, &received_char, 1);
+                }
+                // --- END Conditional Echo Logic ---
+
+                // Store the actual character in buffer regardless of echo
                 dest_buffer[current_pos] = received_char;
                 current_pos++;
             }
             // Ignore other non-printable characters
         }
-        // Handle potential errors from uart_read_bytes if needed (e.g., len < 0)
-        // else { ESP_LOGE(TAG, "UART read error"); break; }
     }
     // Ensure null termination even if max_len-1 characters were entered without Enter
     dest_buffer[max_len - 1] = '\0';
-
-    // Optional: Log the final string read
-    // ESP_LOGI(TAG, "Read line: '%s'", dest_buffer);
-    // ESP_LOG_BUFFER_HEXDUMP(TAG, dest_buffer, strlen(dest_buffer) + 1, ESP_LOG_INFO);
 }
-
 
 // --- Provisioning Wi-Fi Credentials ---
 static void provision_wifi_credentials(void)
 {
-    // char buffer[BUF_SIZE]; // No longer needed if read_line_from_uart is used directly
-    // int pos = 0;          // No longer needed
 
     // Load existing credentials if they exist
 	load_provision_data();
@@ -237,17 +242,18 @@ static void provision_wifi_credentials(void)
     }
 
     // Prompt for SSID
-    read_line_from_uart(ssid, sizeof(ssid), "Enter Wi-Fi SSID: ");
+    read_line_from_uart(ssid, sizeof(ssid), "Enter Wi-Fi SSID: ", false);
 
     // Prompt for password
-    read_line_from_uart(password, sizeof(password), "Enter Wi-Fi Password: ");
+    read_line_from_uart(password, sizeof(password), "Enter Wi-Fi Password: " , true);
 
     // Prompt for MQTT broker
-    read_line_from_uart(mqtt_broker, sizeof(mqtt_broker), "Enter MQTT Broker IP or Hostname: ");
+    read_line_from_uart(mqtt_broker, sizeof(mqtt_broker), "Enter MQTT Broker IP or Hostname: ", false);
 
-        // Prompt for MQTT Client ID with corrected, simple guidance string
+    // Prompt for MQTT Client ID with corrected, simple guidance string
     read_line_from_uart(mqtt_client_id, sizeof(mqtt_client_id),
-   "Enter Unique MQTT Client ID (use A-Z, a-z, 0-9, -, _ ; avoid spaces, /, #, +): ");
+    "Enter Unique MQTT Client ID (use A-Z, a-z, 0-9, -, _ ; avoid spaces, /, #, +): ",
+    false);
 
     printf("\nSaving configuration:\n");
     printf("  SSID: %s\n", ssid);
