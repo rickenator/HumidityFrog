@@ -124,13 +124,13 @@ static esp_err_t wait_for_level(gpio_num_t pin, int level, uint32_t timeout_us) 
  * ASCII Diagram (Typical 3/4 pin module):
  *
  *       ESP32                     DHT11 Module
- *      +-----+                   +-----------+
- *      | 3V3 |-------------------| VCC / +   |
- *      |     |                   |           |
- *      | GND |-------------------| GND / -   |
- *      |     |       +----[R]---+           |  R = 4.7k-10k Pull-up
- *      | GPIO4 |-------+---------| DATA / out|
- *      +-----+                   +-----------+
+ *      +-------+                   +-----------+
+ *      | 3V3   |-------------------| VCC / +   |
+ *      |       |                   |           |
+ *      | GND   |-------------------| GND / -   |
+ *      |       |       |+--[R]--+  |           |  R = 4.7k-10k Pull-up
+ *      | GPIO4 |-------+-----------| DATA / out|
+ *      +-------+                   +-----------+
  *
  * @param temp Pointer to float where temperature (Celsius) will be stored.
  * @param hum Pointer to float where humidity (%) will be stored.
