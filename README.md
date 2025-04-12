@@ -1,5 +1,5 @@
-ESP-IDF HumidityFrog
-====================
+ESP-DHT11-MQTT HumidityFrog
+===========================
 
 ## Circuit Diagram
 
