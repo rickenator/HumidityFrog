@@ -41,8 +41,8 @@ It uses a low-budget DHT11 sensor, not the most accurate thing in the world but 
  *      | 3V3   |-------------------| VCC / +   |
  *      |       |                   |           |
  *      | GND   |-------------------| GND / -   |
- *      |       |       +----[R]---+            |  R = 4.7k-10k Pull-up
- *      | GPIO4 |-------+---------  | DATA / out|
+ *      |       |       |+--[R]---+ |           |  R = 4.7k-10k Pull-up
+ *      | GPIO4 |-------+-----------| DATA / out|
  *      +-------+                   +-----------+
  *
 
